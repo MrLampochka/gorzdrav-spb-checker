@@ -205,16 +205,23 @@ class NotifyState:
             "doctor": found.doctor.name,
             "signature": found.signature,
             "notified_at": datetime.datetime.now(SPB_TIMEZONE).isoformat(),
+            "missing_checks": 0,
         }
 
-    def forget_gone(self, active_keys: set[str]) -> None:
+    def forget_gone(self, active_keys: set[str], required_missing_checks: int = 2) -> None:
         """
-        Забывает врачей, у которых мест больше нет.
-        Тогда при следующем появлении талона письмо придёт сразу.
+        Забывает врачей только после нескольких проверок без мест.
+        Это защищает от временного пустого ответа API.
         """
-        for key in list(self.data):
-            if key not in active_keys:
+        for key, previous in list(self.data.items()):
+            if key in active_keys:
+                previous["missing_checks"] = 0
+                continue
+            missing_checks = int(previous.get("missing_checks", 0)) + 1
+            if missing_checks >= required_missing_checks:
                 del self.data[key]
+            else:
+                previous["missing_checks"] = missing_checks
 
 
 def appointments_in_limit(

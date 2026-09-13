@@ -181,7 +181,17 @@ class TestNotifyState(unittest.TestCase):
         found = make_found()
         state.mark_notified(found)
         state.forget_gone(active_keys=set())
+        self.assertFalse(state.should_notify(found))
+        state.forget_gone(active_keys=set())
         self.assertTrue(state.should_notify(found))
+
+    def test_keeps_state_when_one_check_temporarily_has_no_results(self):
+        state = NotifyState(self.path, cooldown_hours=6)
+        found = make_found()
+        state.mark_notified(found)
+        state.forget_gone(active_keys=set())
+        state.forget_gone(active_keys={found.key})
+        self.assertFalse(state.should_notify(found))
 
     def test_notifies_after_cooldown(self):
         state = NotifyState(self.path, cooldown_hours=1)
