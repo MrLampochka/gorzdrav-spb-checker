@@ -1,0 +1,14 @@
+[
+    {
+        "name": "Терапия, поликлиника №1",
+        "districtId": "1",
+        "lpuId": 1054,
+        "specialtyId": "98",
+        "doctorIds": ["42"]
+    },
+    {
+        "name": "Конкретный врач по ссылке с сайта",
+        "url": "https://gorzdrav.spb.ru/service-free-schedule#...",
+        "limitDays": 14
+    }
+]

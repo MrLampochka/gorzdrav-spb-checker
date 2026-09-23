@@ -18,7 +18,7 @@ from checker import (
     Watch,
     appointments_in_limit,
 )
-from settings import Settings, load_env
+from settings import Settings
 
 DOCTOR_URL = (
     "https://gorzdrav.spb.ru/service-free-schedule#"

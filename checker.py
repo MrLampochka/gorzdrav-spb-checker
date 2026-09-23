@@ -22,7 +22,7 @@ from pathlib import Path
 
 import gorzdrav
 import notifier
-from settings import BASE_DIR, Settings
+from settings import Settings
 
 logger = logging.getLogger("checker")
 
@@ -32,7 +32,7 @@ MAX_LIMIT_DAYS = 99
 WATCHES_EXAMPLE = [
     {
         "name": "Терапия, поликлиника №1",
-        "districtId": "2",
+        "districtId": "1",
         "lpuId": 1054,
         "specialtyId": "98",
     },
