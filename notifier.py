@@ -190,3 +190,86 @@ def compose_html(found_doctors: list) -> str:
         + "Письмо отправлено скриптом gorzdrav-email-checker.</p>"
         + "</body></html>"
     )
+
+
+def describe_booking(booking) -> str:
+    """Время, кабинет и адрес записи"""
+    parts = [booking.visit_start.strftime("%d.%m.%Y %H:%M")]
+    if booking.room:
+        parts.append(f"кабинет {booking.room}")
+    if booking.address:
+        parts.append(booking.address)
+    return ", ".join(parts)
+
+
+def compose_booking_subject(events: list) -> str:
+    """Тема письма об автозаписи"""
+    event = events[0]
+    if len(events) > 1:
+        return f"Горздрав: изменения в записях - {len(events)}"
+    when = event.booking.visit_start.strftime("%d.%m %H:%M") if event.booking else ""
+    return {
+        "booked": f"Горздрав: вы записаны на {when}",
+        "rebooked": f"Горздрав: перезаписал на {when}",
+        "cancelled": f"Горздрав: запись на {when} отменена",
+    }.get(event.kind, f"Горздрав: автозапись не удалась ({event.watch})")
+
+
+def _booking_lines(event, cancel_base_url: str) -> list[tuple[str, str]]:
+    """Строки письма о событии: (текст, ссылка)"""
+    titles = {
+        "booked": "Записал на приём",
+        "rebooked": "Перезаписал на более удобное время",
+        "cancelled": "Запись отменена",
+        "failed": "Автозапись не удалась",
+    }
+    lines = [(f"{titles.get(event.kind, event.kind)} - {event.watch}", "")]
+    if event.booking:
+        lines.append((event.booking.doctor_name, ""))
+        lines.append((describe_booking(event.booking), ""))
+    if event.previous:
+        lines.append(("Прежняя запись отменена: " + describe_booking(event.previous), ""))
+    if event.message:
+        lines.append((event.message, ""))
+    if event.booking and event.booking.is_active and cancel_base_url:
+        link = f"{cancel_base_url.rstrip('/')}/cancel/{event.booking.token}"
+        lines.append(("Отменить запись", link))
+    return lines
+
+
+def compose_booking_text(events: list, cancel_base_url: str = "") -> str:
+    blocks = []
+    for event in events:
+        title, *rest = _booking_lines(event, cancel_base_url)
+        lines = [title[0]] + [
+            f"  {text}: {link}" if link else f"  {text}" for text, link in rest
+        ]
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) + "\n\nПисьмо отправлено скриптом gorzdrav-email-checker."
+
+
+def compose_booking_html(events: list, cancel_base_url: str = "") -> str:
+    items = []
+    for event in events:
+        rows = []
+        for index, (text, link) in enumerate(_booking_lines(event, cancel_base_url)):
+            if link:
+                rows.append(
+                    f"<div style='margin-top:8px'><a href='{html.escape(link)}' "
+                    + "style='color:#b42318'>"
+                    + f"{html.escape(text)}</a></div>"
+                )
+            elif index == 0:
+                rows.append(f"<div><b>{html.escape(text)}</b></div>")
+            else:
+                rows.append(f"<div>{html.escape(text)}</div>")
+        items.append("<li style='margin-bottom:16px'>" + "".join(rows) + "</li>")
+    return (
+        '<html><body style="font-family:Arial,sans-serif">'
+        + "<ul style='list-style:none;padding-left:0'>"
+        + "".join(items)
+        + "</ul>"
+        + "<p style='color:#888;font-size:12px'>"
+        + "Письмо отправлено скриптом gorzdrav-email-checker.</p>"
+        + "</body></html>"
+    )

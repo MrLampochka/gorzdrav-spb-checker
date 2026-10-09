@@ -23,7 +23,7 @@ Restart=always
 RestartSec=60
 Environment=PYTHONUNBUFFERED=1
 
-# каталог со скриптом должен быть доступен на запись: туда пишется state.json
+# каталог со скриптом должен быть доступен на запись: туда пишутся state.json и bookings.json
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

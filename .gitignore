@@ -2,3 +2,5 @@ __pycache__/
 .env
 state.json
 watches.json
+bookings.json
+bookings.tmp

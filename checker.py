@@ -20,6 +20,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import booking
+import cancel_server
 import gorzdrav
 import notifier
 from settings import Settings
@@ -49,6 +51,17 @@ def spb_today() -> datetime.date:
     return datetime.datetime.now(SPB_TIMEZONE).date()
 
 
+def _auto_book_mode(value) -> str:
+    """autoBook: true - записаться один раз, "weekly" - раз в неделю"""
+    if value in (None, False, "", "false"):
+        return ""
+    if value is True or value == booking.MODE_ONCE:
+        return booking.MODE_ONCE
+    if value == booking.MODE_WEEKLY:
+        return booking.MODE_WEEKLY
+    raise ValueError(f"autoBook может быть true или \"weekly\", а не {value!r}")
+
+
 @dataclass
 class Watch:
     """Что отслеживаем: врач или вся специальность в медучреждении"""
@@ -63,6 +76,10 @@ class Watch:
     any_doctor: bool = False
     limit_days: int | None = None
     email: list[str] = field(default_factory=list)
+    auto_book: str = ""
+    preferred_hours: list[int] = field(
+        default_factory=lambda: list(booking.DEFAULT_PREFERRED_HOURS)
+    )
 
     @classmethod
     def from_dict(cls, data: dict) -> "Watch":
@@ -81,6 +98,9 @@ class Watch:
             any_doctor=bool(data.get("anyDoctor")),
             limit_days=data.get("limitDays"),
             email=[str(item) for item in data.get("email") or []],
+            auto_book=_auto_book_mode(data.get("autoBook")),
+            preferred_hours=[int(item) for item in data.get("preferredHours") or []]
+            or list(booking.DEFAULT_PREFERRED_HOURS),
         )
         if watch.url:
             watch._fill_from_url()
@@ -297,6 +317,10 @@ def check_watch(watch: Watch) -> list[FoundDoctor]:
     return found
 
 
+class WatchesError(Exception):
+    """Файл отслеживаний не удалось прочитать"""
+
+
 def load_watches(path: Path) -> list[Watch]:
     """
     Читает список отслеживаний из json файла.
@@ -314,10 +338,40 @@ def load_watches(path: Path) -> list[Watch]:
         sys.exit(1)
 
     try:
+        return read_watches(path)
+    except WatchesError as error:
+        logger.error("%s", error)
+        sys.exit(1)
+
+
+def reload_watches(path: Path, current: list[Watch]) -> list[Watch]:
+    """
+    Перечитывает файл отслеживаний перед очередной проверкой,
+    чтобы правки watches.json применялись без перезапуска.
+    Если файл пропал или сломан - продолжаем с прежним списком.
+    """
+    try:
+        watches = read_watches(path)
+    except WatchesError as error:
+        logger.error("%s, проверяем по прежнему списку", error)
+        return current
+    if watches != current:
+        logger.info("список отслеживаний изменился, теперь их: %s", len(watches))
+        for watch in watches:
+            logger.info("- %s", watch.name)
+    return watches
+
+
+def read_watches(path: Path) -> list[Watch]:
+    """
+    Разбирает json файл со списком отслеживаний.
+    Raises:
+        WatchesError: файла нет или в нём не json
+    """
+    try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as error:
-        logger.error("не удалось прочитать %s: %s", path, error)
-        sys.exit(1)
+        raise WatchesError(f"не удалось прочитать {path}: {error}") from error
 
     if isinstance(raw, dict):
         raw = [raw]
@@ -367,21 +421,67 @@ def notify(
         )
 
 
+def notify_booking(
+    events: list[booking.BookingEvent],
+    sender: notifier.EmailSender | None,
+    default_recipients: list[str],
+    cancel_base_url: str,
+) -> None:
+    """Письма о записях, отменах и ошибках автозаписи"""
+    by_recipients: dict[tuple[str, ...], list[booking.BookingEvent]] = {}
+    for event in events:
+        recipients = tuple(event.recipients or default_recipients)
+        by_recipients.setdefault(recipients, []).append(event)
+
+    for recipients, group in by_recipients.items():
+        subject = notifier.compose_booking_subject(group)
+        text = notifier.compose_booking_text(group, cancel_base_url)
+        if sender is None:
+            print(f"\n--- {subject} -> {', '.join(recipients) or 'никому'} ---")
+            print(text)
+            continue
+        if not recipients:
+            logger.error("не задан EMAIL_TO и в отслеживании нет поля email")
+            continue
+        try:
+            sender.send(
+                to=list(recipients),
+                subject=subject,
+                text=text,
+                html_body=notifier.compose_booking_html(group, cancel_base_url),
+            )
+        except notifier.EmailError as error:
+            # запись уже сделана, письмо - не повод падать
+            logger.error("письмо о записи не ушло: %s", error)
+
+
 def run_once(
     watches: list[Watch],
     state: NotifyState,
     sender: notifier.EmailSender | None,
     default_recipients: list[str],
+    booker: booking.Booker | None = None,
+    cancel_base_url: str = "",
 ) -> int:
     """
-    Одна проверка всех отслеживаний
+    Одна проверка всех отслеживаний.
+    Отслеживания с автозаписью не шлют писем о свободных местах -
+    только о том, что записали, перезаписали или не смогли.
     Returns:
         int: сколько врачей попало в письма
     """
     found_doctors: list[FoundDoctor] = []
+    events: list[booking.BookingEvent] = []
     for watch in watches:
+        if watch.auto_book and booker is not None and booker.is_done(watch):
+            logger.debug("'%s': уже записаны, не проверяем", watch.name)
+            continue
         try:
-            found_doctors.extend(check_watch(watch))
+            found = check_watch(watch)
+            if not watch.auto_book:
+                found_doctors.extend(found)
+            elif found and booker is not None:
+                events.extend(booker.process(watch, found))
         except gorzdrav.GorzdravError as error:
             # медучреждение может не отвечать, ждём следующей проверки
             logger.warning("ошибка проверки '%s': %s", watch.name, error)
@@ -389,6 +489,8 @@ def run_once(
             logger.exception("неожиданная ошибка проверки '%s'", watch.name)
 
     logger.info("врачей со свободными местами: %s", len(found_doctors))
+    if events:
+        notify_booking(events, sender, default_recipients, cancel_base_url)
 
     state.forget_gone({found.key for found in found_doctors})
     to_notify = [found for found in found_doctors if state.should_notify(found)]
@@ -473,6 +575,11 @@ def parse_args(settings: Settings) -> argparse.Namespace:
                         help="список специальностей")
     parser.add_argument("--list-doctors", nargs=2, metavar=("LPU_ID", "SPECIALTY_ID"),
                         help="список врачей по специальности")
+    parser.add_argument("--check-patient", metavar="LPU_ID", type=int,
+                        help="проверить, что горздрав находит пациента из .env в лпу")
+    parser.add_argument("--bookings", action="store_true", help="записи, сделанные ботом")
+    parser.add_argument("--cancel", metavar="TOKEN",
+                        help="отменить запись бота (токен из --bookings или ссылки в письме)")
     return parser.parse_args()
 
 
@@ -485,6 +592,28 @@ def main() -> None:
     )
 
     if print_reference(args):
+        return
+
+    patient: gorzdrav.Patient | None = None
+    patient_error = ""
+    try:
+        patient = settings.patient()
+    except ValueError as error:
+        patient_error = str(error)
+
+    if args.check_patient is not None:
+        if patient is None:
+            logger.error("%s", patient_error)
+            sys.exit(1)
+        try:
+            patient_id = gorzdrav.find_patient(args.check_patient, patient)
+        except gorzdrav.GorzdravError as error:
+            logger.error("пациент не найден: %s", error)
+            sys.exit(1)
+        print(f"пациент найден в лпу {args.check_patient}, patientId {patient_id}")
+        return
+
+    if manage_bookings(args, settings, patient):
         return
 
     if args.check_email:
@@ -530,6 +659,11 @@ def main() -> None:
         readonly=args.dry_run,
     )
 
+    if any(watch.auto_book for watch in watches) and patient is None:
+        logger.error("%s", patient_error)
+        sys.exit(1)
+    booker = make_booker(settings, patient, patient_error, args.dry_run, default_recipients)
+
     logger.info("отслеживаний: %s", len(watches))
     for watch in watches:
         logger.info(
@@ -540,15 +674,86 @@ def main() -> None:
             ", ".join(watch.doctor_ids) if watch.doctor_ids else "любые",
             watch.effective_limit_days or "без лимита",
         )
+        if watch.auto_book:
+            active = [item for item in booker.store.for_watch(watch.name) if item.is_active]
+            logger.info(
+                "  автозапись: %s, часы по удобству: %s%s",
+                "раз в неделю" if watch.auto_book == booking.MODE_WEEKLY else "один раз",
+                ", ".join(str(hour) for hour in watch.preferred_hours[:6]) + "...",
+                "; записи: " + ", ".join(
+                    item.visit_start.strftime("%d.%m %H:%M") for item in active
+                ) if active else "",
+            )
 
+    cancel_base_url = settings.cancel_url
     if args.once:
-        run_once(watches, state, sender, default_recipients)
+        run_once(watches, state, sender, default_recipients, booker, cancel_base_url)
         return
+
+    if cancel_base_url and not args.dry_run:
+        def on_cancel(cancelled: booking.Booking) -> None:
+            notify_booking(
+                [booking.BookingEvent(kind="cancelled", watch=cancelled.watch, booking=cancelled)],
+                sender,
+                default_recipients,
+                cancel_base_url,
+            )
+
+        cancel_server.start(settings.cancel_listen, booker, on_cancel)
 
     logger.info("проверка каждые %s секунд, выход по Ctrl+C", args.interval)
     while True:
-        run_once(watches, state, sender, default_recipients)
+        if not args.url:
+            watches = reload_watches(Path(args.config), watches)
+        run_once(watches, state, sender, default_recipients, booker, cancel_base_url)
         time.sleep(args.interval)
+
+
+def make_booker(
+    settings: Settings,
+    patient: gorzdrav.Patient | None,
+    patient_error: str,
+    dry_run: bool,
+    default_recipients: list[str],
+) -> booking.Booker:
+    try:
+        store = booking.BookingStore(settings.bookings_file, readonly=dry_run)
+    except RuntimeError as error:
+        logger.error("%s", error)
+        sys.exit(1)
+    return booking.Booker(
+        patient=patient,
+        store=store,
+        patient_error=patient_error,
+        dry_run=dry_run,
+        default_email=default_recipients[0] if default_recipients else "",
+        failure_cooldown_hours=settings.cooldown_hours,
+    )
+
+
+def manage_bookings(args: argparse.Namespace, settings: Settings, patient) -> bool:
+    """--bookings и --cancel"""
+    if not args.bookings and not args.cancel:
+        return False
+    booker = make_booker(settings, patient, "", False, settings.email_to)
+    if args.bookings:
+        for item in booker.store.bookings:
+            status = "активна" if item.is_active else f"отменена ({item.cancelled_by})"
+            print(
+                f"{item.token}\t{item.visit_start.strftime('%d.%m.%Y %H:%M')}\t"
+                + f"{item.doctor_name}\t{item.watch}\t{status}"
+            )
+        return True
+    try:
+        cancelled = booker.cancel_by_user(args.cancel)
+    except KeyError:
+        logger.error("нет записи с токеном %s, см. --bookings", args.cancel)
+        sys.exit(1)
+    except gorzdrav.GorzdravError as error:
+        logger.error("горздрав не отменил запись: %s", error)
+        sys.exit(1)
+    print(f"запись на {cancelled.visit_start.strftime('%d.%m.%Y %H:%M')} отменена")
+    return True
 
 
 if __name__ == "__main__":

@@ -1,8 +1,11 @@
 """Настройки скрипта: читаются из .env рядом со скриптом и из окружения"""
 
+import datetime
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from gorzdrav import Patient
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
@@ -78,6 +81,43 @@ class Settings:
     interval_secs: int = 300
     cooldown_hours: float = 6.0
     log_level: str = "INFO"
+    patient_last_name: str = ""
+    patient_first_name: str = ""
+    patient_middle_name: str = ""
+    patient_birthdate: str = ""
+    bookings_file: Path = BASE_DIR / "bookings.json"
+    cancel_url: str = ""
+    cancel_listen: str = "127.0.0.1:8085"
+
+    def patient(self) -> Patient:
+        """
+        Пациент для автозаписи
+        Raises:
+            ValueError: данные пациента не заданы или дата рождения кривая
+        """
+        missing = [
+            name
+            for name, value in (
+                ("PATIENT_LAST_NAME", self.patient_last_name),
+                ("PATIENT_FIRST_NAME", self.patient_first_name),
+                ("PATIENT_BIRTHDATE", self.patient_birthdate),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError("для автозаписи не заданы настройки: " + ", ".join(missing))
+        try:
+            birthdate = datetime.datetime.strptime(self.patient_birthdate, "%d.%m.%Y").date()
+        except ValueError as error:
+            raise ValueError(
+                f"PATIENT_BIRTHDATE должна быть в формате ДД.ММ.ГГГГ, а не {self.patient_birthdate}"
+            ) from error
+        return Patient(
+            last_name=self.patient_last_name,
+            first_name=self.patient_first_name,
+            middle_name=self.patient_middle_name,
+            birthdate=birthdate,
+        )
 
     @classmethod
     def load(cls, env_file: Path = ENV_FILE) -> "Settings":
@@ -104,4 +144,13 @@ class Settings:
             interval_secs=_int_env("CHECK_INTERVAL_SECS", 300),
             cooldown_hours=_float_env("COOLDOWN_HOURS", 6.0),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
+            patient_last_name=os.environ.get("PATIENT_LAST_NAME", "").strip(),
+            patient_first_name=os.environ.get("PATIENT_FIRST_NAME", "").strip(),
+            patient_middle_name=os.environ.get("PATIENT_MIDDLE_NAME", "").strip(),
+            patient_birthdate=os.environ.get("PATIENT_BIRTHDATE", "").strip(),
+            bookings_file=Path(
+                os.environ.get("BOOKINGS_FILE", str(BASE_DIR / "bookings.json"))
+            ),
+            cancel_url=os.environ.get("CANCEL_URL", "").strip(),
+            cancel_listen=os.environ.get("CANCEL_LISTEN", "127.0.0.1:8085").strip(),
         )
