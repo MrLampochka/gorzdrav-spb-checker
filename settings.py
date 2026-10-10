@@ -79,6 +79,8 @@ class Settings:
     watches_file: Path = BASE_DIR / "watches.json"
     state_file: Path = BASE_DIR / "state.json"
     interval_secs: int = 300
+    # если больше interval_secs, пауза между проверками случайная в этих пределах
+    interval_max_secs: int = 300
     cooldown_hours: float = 6.0
     log_level: str = "INFO"
     patient_last_name: str = ""
@@ -119,6 +121,9 @@ class Settings:
             birthdate=birthdate,
         )
 
+    def __post_init__(self) -> None:
+        self.interval_max_secs = max(self.interval_max_secs, self.interval_secs)
+
     @classmethod
     def load(cls, env_file: Path = ENV_FILE) -> "Settings":
         """Собирает настройки из .env и переменных окружения"""
@@ -142,6 +147,7 @@ class Settings:
             ),
             state_file=Path(os.environ.get("STATE_FILE", str(BASE_DIR / "state.json"))),
             interval_secs=_int_env("CHECK_INTERVAL_SECS", 300),
+            interval_max_secs=_int_env("CHECK_INTERVAL_MAX_SECS", 0),
             cooldown_hours=_float_env("COOLDOWN_HOURS", 6.0),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
             patient_last_name=os.environ.get("PATIENT_LAST_NAME", "").strip(),

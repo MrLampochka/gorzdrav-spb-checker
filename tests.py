@@ -438,20 +438,25 @@ class TestBooker(unittest.TestCase):
         self.assertEqual(self.booker().process(self.weekly, found_with(slot_at(1, 16))), [])
         self.assertEqual(list(self.fake.booked), [slot_at(0, 9).id])
 
-    def test_user_cancel_skips_week(self):
+    def test_user_cancel_excludes_only_that_day_and_hour(self):
         booker = self.booker()
         events = booker.process(self.weekly, found_with(slot_at(0, 16)))
         booker.cancel_by_user(events[0].booking.token)
         self.assertEqual(self.fake.booked, {})
-        self.assertEqual(booker.process(self.weekly, found_with(slot_at(1, 16))), [])
+        # тот же день и час (16:30 в понедельник) - нет, вторник 16:00 - да
+        events = booker.process(self.weekly, found_with(slot_at(0, 16, 30), slot_at(1, 16)))
+        self.assertEqual([event.booking.visit_start for event in events], [slot_at(1, 16).visit_start])
 
-    def test_cancel_outside_skips_week_after_two_checks(self):
+    def test_cancel_outside_excludes_hour_after_two_checks(self):
         booker = self.booker()
         booker.process(self.weekly, found_with(slot_at(0, 16)))
         self.fake.booked.clear()
-        self.assertEqual(booker.process(self.weekly, found_with(slot_at(1, 16))), [])
-        self.assertEqual(booker.process(self.weekly, found_with(slot_at(1, 16))), [])
-        self.assertEqual(self.fake.booked, {})
+        found = found_with(slot_at(0, 16), slot_at(2, 9))
+        # первая проверка: запись пропала, но ещё не считаем отменённой
+        self.assertEqual(booker.process(self.weekly, found), [])
+        # вторая: отменена вами, 16:00 понедельника не берём, берём что осталось
+        events = booker.process(self.weekly, found)
+        self.assertEqual([event.booking.visit_start for event in events], [slot_at(2, 9).visit_start])
 
     def test_once_mode_books_single_best(self):
         watch = Watch.from_dict({"name": "раз", "lpuId": 526, "specialtyId": "92", "autoBook": True})
@@ -532,6 +537,11 @@ class TestCancelServer(unittest.TestCase):
 
 
 class TestSettings(unittest.TestCase):
+    def test_random_interval_bounds(self):
+        self.assertEqual(Settings(interval_secs=300).interval_max_secs, 300)
+        self.assertEqual(Settings(interval_secs=300, interval_max_secs=900).interval_max_secs, 900)
+        self.assertEqual(Settings(interval_secs=600, interval_max_secs=60).interval_max_secs, 600)
+
     def test_patient_from_settings(self):
         settings = Settings(
             patient_last_name="Иванов",

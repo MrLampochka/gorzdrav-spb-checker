@@ -87,7 +87,7 @@ def make_handler(
                 "Отменить запись?",
                 _describe(booking)
                 + "<form method='post'><button type='submit'>Отменить запись</button></form>"
-                + "<p class='muted'>Бот не будет записывать вас на эту неделю снова.</p>",
+                + "<p class='muted'>Бот не будет снова записывать вас на это время, но может найти другое в эту неделю.</p>",
             )
 
         def do_POST(self) -> None:

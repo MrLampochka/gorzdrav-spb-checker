@@ -15,6 +15,7 @@ import argparse
 import datetime
 import json
 import logging
+import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -563,6 +564,8 @@ def parse_args(settings: Settings) -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="одна проверка и выход")
     parser.add_argument("--interval", type=int, default=settings.interval_secs,
                         help=f"период проверок в секундах (по умолчанию {settings.interval_secs})")
+    parser.add_argument("--interval-max", type=int, default=settings.interval_max_secs,
+                        help="если задано больше --interval, пауза случайная между ними")
     parser.add_argument("--dry-run", action="store_true",
                         help="не отправлять письма, а печатать их в консоль")
     parser.add_argument("--state-file", default=str(settings.state_file),
@@ -701,12 +704,19 @@ def main() -> None:
 
         cancel_server.start(settings.cancel_listen, booker, on_cancel)
 
-    logger.info("проверка каждые %s секунд, выход по Ctrl+C", args.interval)
+    interval_max = max(args.interval_max, args.interval)
+    if interval_max > args.interval:
+        logger.info(
+            "проверка через случайные %s-%s секунд, выход по Ctrl+C", args.interval, interval_max
+        )
+    else:
+        logger.info("проверка каждые %s секунд, выход по Ctrl+C", args.interval)
     while True:
         if not args.url:
             watches = reload_watches(Path(args.config), watches)
         run_once(watches, state, sender, default_recipients, booker, cancel_base_url)
-        time.sleep(args.interval)
+        # случайная пауза, чтобы запросы не шли по ровному расписанию
+        time.sleep(random.uniform(args.interval, interval_max))
 
 
 def make_booker(

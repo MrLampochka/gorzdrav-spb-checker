@@ -7,6 +7,8 @@
              и перезаписываться, если появилось более удобное время
 
 Удобство времени задаётся порядком часов: по умолчанию 16, 17, 18, 19, 15, 14...
+Если вы отменили запись бота, он больше не записывает на этот день и час,
+но в ту же неделю на другое время записать может.
 Все записи бота лежат в bookings.json, у каждой есть токен для ссылки отмены.
 """
 
@@ -224,13 +226,13 @@ class BookingStore:
             key=lambda item: (item.rank, item.visit_start),
         )
 
-    def week_skipped(self, watch_name: str, week: str) -> bool:
-        """Неделю пропускаем, если запись в ней отменили вы, а не бот"""
-        return any(
-            item.week == week
-            and item.cancelled_by in (CANCELLED_BY_USER, CANCELLED_OUTSIDE)
+    def excluded_hours(self, watch_name: str) -> set[tuple[datetime.date, int]]:
+        """День и час записей, которые отменили вы, а не бот - туда больше не записываем"""
+        return {
+            (item.visit_start.date(), item.visit_start.hour)
             for item in self.for_watch(watch_name)
-        )
+            if item.cancelled_by in (CANCELLED_BY_USER, CANCELLED_OUTSIDE)
+        }
 
     def owns(self, appointment_id: str) -> bool:
         with self.lock:
@@ -337,10 +339,13 @@ class Booker:
         ]
         self._sync(watch, existing, now)
 
+        excluded = self.store.excluded_hours(watch.name)
         slots = [
             slot
             for slot in rank_slots(found_doctors, watch.preferred_hours, now)
             if not self.store.slot_failed_recently(slot.appointment.id, now)
+            and (slot.appointment.visit_start.date(), slot.appointment.visit_start.hour)
+            not in excluded
         ]
         if watch.auto_book == MODE_ONCE:
             groups = {"": slots}
@@ -356,8 +361,6 @@ class Booker:
             ]
             # запись, сделанную вами вручную, бот не трогает
             if any(not self.store.owns(item.id) for item in in_week):
-                continue
-            if week and self.store.week_skipped(watch.name, week):
                 continue
             mine = self.store.active_in_week(watch.name, week) if week else []
             if not mine:
@@ -381,9 +384,9 @@ class Booker:
             booking.missing_checks += 1
             if booking.missing_checks >= REQUIRED_MISSING_CHECKS:
                 logger.info(
-                    "запись на %s пропала из горздрава, считаем отменённой - неделю %s пропускаем",
+                    "запись на %s пропала из горздрава, считаем отменённой вами - "
+                    + "на этот час больше не записываем",
                     booking.visit_start,
-                    booking.week,
                 )
                 booking.status = STATUS_CANCELLED
                 booking.cancelled_by = CANCELLED_OUTSIDE
@@ -548,7 +551,7 @@ class Booker:
 
     def cancel_by_user(self, token: str) -> Booking:
         """
-        Отмена по ссылке из письма. Неделя после этого пропускается
+        Отмена по ссылке из письма. На этот день и час бот больше не записывает
         Raises:
             KeyError: нет записи с таким токеном
             gorzdrav.GorzdravError: горздрав не отменил
