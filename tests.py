@@ -5,6 +5,7 @@
 """
 
 import datetime
+import imaplib
 import json
 import tempfile
 import unittest
@@ -494,10 +495,141 @@ class TestBooker(unittest.TestCase):
             booking.BookingStore(self.path)
 
     def test_email_has_cancel_link(self):
+        import cancel_server
+
         events = self.booker().process(self.weekly, found_with(slot_at(0, 16)))
-        text = notifier.compose_booking_text(events, "https://example.ru/gz")
-        self.assertIn("/cancel/" + events[0].booking.token, text)
+        text = notifier.compose_booking_text(events, cancel_server.WebCancel("https://example.ru/gz/"))
+        self.assertIn("https://example.ru/gz/cancel/" + events[0].booking.token, text)
         self.assertIn("вы записаны", notifier.compose_booking_subject(events))
+
+    def test_email_has_mailto_cancel(self):
+        import mail_cancel
+
+        events = self.booker().process(self.weekly, found_with(slot_at(0, 16)))
+        token = events[0].booking.token
+        mailbox = mail_cancel.CancelMailbox("imap.mail.ru", 993, "bot@mail.ru", "x", [])
+        html_body = notifier.compose_booking_html(events, mailbox)
+        self.assertIn("mailto:bot@mail.ru?subject=", html_body)
+        self.assertIn("cancel%3A" + token, html_body)
+        self.assertIn("cancel:" + token, notifier.compose_booking_text(events, mailbox))
+        # у отменённой записи кнопки нет
+        events[0].booking.status = booking.STATUS_CANCELLED
+        self.assertNotIn("mailto:", notifier.compose_booking_html(events, mailbox))
+
+
+class FakeImap:
+    """IMAP в памяти: письма лежат во входящих и отправленных"""
+
+    def __init__(self, folders: dict[str, list[bytes]]):
+        self.folders = folders
+        self.selected = ""
+        self.readonly = None
+        self.searches = []
+
+    def login(self, user, password):
+        if password != "secret":
+            raise imaplib.IMAP4.error("AUTHENTICATIONFAILED")
+
+    def list(self):
+        return "OK", [b'(\\HasNoChildren) "/" "INBOX"', b'(\\Sent \\HasNoChildren) "/" "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-"']
+
+    def select(self, folder, readonly=False):
+        self.selected = folder.strip('"')
+        self.readonly = readonly
+        return "OK", [b"1"]
+
+    def search(self, charset, *criteria):
+        self.searches.append(criteria)
+        ids = " ".join(str(index + 1) for index in range(len(self.folders.get(self.selected, []))))
+        return "OK", [ids.encode()]
+
+    def fetch(self, message_id, parts):
+        return "OK", [(b"header", self.folders[self.selected][int(message_id) - 1]), b")"]
+
+    def logout(self):
+        pass
+
+
+def cancel_mail(token: str, sender: str = "me@mail.ru") -> bytes:
+    from email.header import Header
+
+    subject = Header(f"Отменить запись cancel:{token}", "utf-8").encode()
+    return f"From: Я <{sender}>\r\nSubject: {subject}\r\n\r\n".encode()
+
+
+class TestMailCancel(unittest.TestCase):
+    def setUp(self):
+        import mail_cancel
+
+        self.mail_cancel = mail_cancel
+        self.mailbox = mail_cancel.CancelMailbox("imap.mail.ru", 993, "me@mail.ru", "secret", ["Me@Mail.ru"])
+
+    def fetch(self, folders):
+        imap = FakeImap(folders)
+        with mock.patch.object(imaplib, "IMAP4_SSL", return_value=imap):
+            return self.mailbox.fetch_requests(datetime.date(2026, 10, 10)), imap
+
+    def test_finds_token_in_encoded_subject(self):
+        requests, imap = self.fetch({"INBOX": [cancel_mail("tok_abcdefgh")]})
+        self.assertEqual([item.token for item in requests], ["tok_abcdefgh"])
+        self.assertTrue(imap.readonly)
+        self.assertIn("07-Oct-2026", imap.searches[0])
+
+    def test_ignores_foreign_sender(self):
+        requests, _ = self.fetch({"INBOX": [cancel_mail("tok_abcdefgh", sender="evil@example.com")]})
+        self.assertEqual(requests, [])
+
+    def test_reads_sent_folder_and_dedups(self):
+        mail = cancel_mail("tok_abcdefgh")
+        requests, _ = self.fetch({"INBOX": [mail], "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-": [mail]})
+        self.assertEqual(len(requests), 1)
+
+    def test_bad_password_is_error(self):
+        self.mailbox.password = "wrong"
+        with self.assertRaises(self.mail_cancel.MailCancelError):
+            self.fetch({})
+
+    def test_process_cancels_once(self):
+        from checker import process_cancel_requests
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = booking.BookingStore(Path(tmp) / "bookings.json")
+            item = booking.Booking(
+                token="tok_abcdefgh", watch="тест", lpu_id=526, patient_id="p1",
+                appointment_id="a1", doctor_id="21", doctor_name="Бердников",
+                visit_start=MONDAY, rank=0,
+            )
+            store.add(item)
+            booker = booking.Booker(patient=PATIENT, store=store)
+            imap = FakeImap({"INBOX": [cancel_mail("tok_abcdefgh")]})
+            with mock.patch.object(imaplib, "IMAP4_SSL", return_value=imap), \
+                    mock.patch.object(gorzdrav, "cancel_appointment") as cancel:
+                events = process_cancel_requests(self.mailbox, booker)
+                self.assertEqual([event.kind for event in events], ["cancelled"])
+                cancel.assert_called_once_with(526, "p1", "a1")
+                # письмо всё ещё в ящике, но запись уже отменена - второй раз не трогаем
+                self.assertEqual(process_cancel_requests(self.mailbox, booker), [])
+                cancel.assert_called_once()
+            self.assertEqual(item.cancelled_by, "user")
+
+    def test_gorzdrav_error_reported_once_and_retried(self):
+        from checker import process_cancel_requests
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = booking.BookingStore(Path(tmp) / "bookings.json")
+            store.add(booking.Booking(
+                token="tok_abcdefgh", watch="тест", lpu_id=526, patient_id="p1",
+                appointment_id="a1", doctor_id="21", doctor_name="Бердников",
+                visit_start=MONDAY, rank=0,
+            ))
+            booker = booking.Booker(patient=PATIENT, store=store)
+            imap = FakeImap({"INBOX": [cancel_mail("tok_abcdefgh")]})
+            with mock.patch.object(imaplib, "IMAP4_SSL", return_value=imap), \
+                    mock.patch.object(gorzdrav, "cancel_appointment",
+                                      side_effect=gorzdrav.GorzdravError("ошибка")) as cancel:
+                self.assertEqual([e.kind for e in process_cancel_requests(self.mailbox, booker)], ["failed"])
+                self.assertEqual(process_cancel_requests(self.mailbox, booker), [])
+                self.assertEqual(cancel.call_count, 2)
 
 
 class TestCancelServer(unittest.TestCase):
@@ -537,6 +669,15 @@ class TestCancelServer(unittest.TestCase):
 
 
 class TestSettings(unittest.TestCase):
+    def test_imap_host_from_smtp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text('SMTP_HOST="smtp.mail.ru"\nCANCEL_BY_EMAIL=true\n', encoding="utf-8")
+            with mock.patch.dict("os.environ", {}, clear=True):
+                settings = Settings.load(env_file)
+        self.assertEqual(settings.imap_host, "imap.mail.ru")
+        self.assertTrue(settings.cancel_by_email)
+
     def test_random_interval_bounds(self):
         self.assertEqual(Settings(interval_secs=300).interval_max_secs, 300)
         self.assertEqual(Settings(interval_secs=300, interval_max_secs=900).interval_max_secs, 900)

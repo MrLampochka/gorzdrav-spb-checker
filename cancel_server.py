@@ -23,8 +23,17 @@ logger = logging.getLogger("cancel_server")
 CANCEL_PATH = re.compile(r"^/cancel/([A-Za-z0-9_-]{8,64})/?$")
 
 
-def cancel_link(base_url: str, booking: Booking) -> str:
-    return f"{base_url.rstrip('/')}/cancel/{booking.token}"
+class WebCancel:
+    """Ссылка отмены на этот сервер для письма о записи"""
+
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def url(self, booking: Booking) -> str:
+        return f"{self.base_url}/cancel/{booking.token}"
+
+    def hint(self, booking: Booking) -> str:
+        return self.url(booking)
 
 
 def _page(title: str, body: str) -> bytes:

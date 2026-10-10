@@ -215,54 +215,68 @@ def compose_booking_subject(events: list) -> str:
     }.get(event.kind, f"Горздрав: автозапись не удалась ({event.watch})")
 
 
-def _booking_lines(event, cancel_base_url: str) -> list[tuple[str, str]]:
-    """Строки письма о событии: (текст, ссылка)"""
+def _booking_lines(event) -> list[str]:
+    """Строки письма о событии"""
     titles = {
         "booked": "Записал на приём",
         "rebooked": "Перезаписал на более удобное время",
         "cancelled": "Запись отменена",
         "failed": "Автозапись не удалась",
     }
-    lines = [(f"{titles.get(event.kind, event.kind)} - {event.watch}", "")]
+    lines = [f"{titles.get(event.kind, event.kind)} - {event.watch}"]
     if event.booking:
-        lines.append((event.booking.doctor_name, ""))
-        lines.append((describe_booking(event.booking), ""))
+        lines.append(event.booking.doctor_name)
+        lines.append(describe_booking(event.booking))
     if event.previous:
-        lines.append(("Прежняя запись отменена: " + describe_booking(event.previous), ""))
+        lines.append("Прежняя запись отменена: " + describe_booking(event.previous))
     if event.message:
-        lines.append((event.message, ""))
-    if event.booking and event.booking.is_active and cancel_base_url:
-        link = f"{cancel_base_url.rstrip('/')}/cancel/{event.booking.token}"
-        lines.append(("Отменить запись", link))
+        lines.append(event.message)
     return lines
 
 
-def compose_booking_text(events: list, cancel_base_url: str = "") -> str:
+def _cancel_link(event, canceller) -> tuple[str, str] | None:
+    """
+    Ссылка отмены и подсказка к ней. canceller - объект с методами url(booking)
+    и hint(booking): веб-сервер отмены или ящик для писем с отменой
+    """
+    if canceller is None or event.booking is None or not event.booking.is_active:
+        return None
+    return canceller.url(event.booking), canceller.hint(event.booking)
+
+
+def compose_booking_text(events: list, canceller=None) -> str:
     blocks = []
     for event in events:
-        title, *rest = _booking_lines(event, cancel_base_url)
-        lines = [title[0]] + [
-            f"  {text}: {link}" if link else f"  {text}" for text, link in rest
-        ]
+        title, *rest = _booking_lines(event)
+        lines = [title] + [f"  {text}" for text in rest]
+        cancel = _cancel_link(event, canceller)
+        if cancel:
+            lines.append(f"  Отменить запись: {cancel[1]}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks) + "\n\nПисьмо отправлено скриптом gorzdrav-email-checker."
 
 
-def compose_booking_html(events: list, cancel_base_url: str = "") -> str:
+def compose_booking_html(events: list, canceller=None) -> str:
     items = []
     for event in events:
-        rows = []
-        for index, (text, link) in enumerate(_booking_lines(event, cancel_base_url)):
-            if link:
+        title, *rest = _booking_lines(event)
+        rows = [f"<div><b>{html.escape(title)}</b></div>"]
+        rows += [f"<div>{html.escape(text)}</div>" for text in rest]
+        cancel = _cancel_link(event, canceller)
+        if cancel:
+            link, hint = cancel
+            rows.append(
+                f"<div style='margin-top:10px'><a href='{html.escape(link)}' "
+                + "style='display:inline-block;padding:8px 14px;border-radius:6px;"
+                + "background:#b42318;color:#fff;text-decoration:none'>"
+                + "Отменить запись</a></div>"
+            )
+            if not link.startswith("http"):
                 rows.append(
-                    f"<div style='margin-top:8px'><a href='{html.escape(link)}' "
-                    + "style='color:#b42318'>"
-                    + f"{html.escape(text)}</a></div>"
+                    "<div style='color:#888;font-size:12px;margin-top:4px'>"
+                    + f"Откроется готовое письмо - просто отправьте его. Или вручную: {html.escape(hint)}"
+                    + "</div>"
                 )
-            elif index == 0:
-                rows.append(f"<div><b>{html.escape(text)}</b></div>")
-            else:
-                rows.append(f"<div>{html.escape(text)}</div>")
         items.append("<li style='margin-bottom:16px'>" + "".join(rows) + "</li>")
     return (
         '<html><body style="font-family:Arial,sans-serif">'

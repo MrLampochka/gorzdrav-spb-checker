@@ -24,6 +24,7 @@ from pathlib import Path
 import booking
 import cancel_server
 import gorzdrav
+import mail_cancel
 import notifier
 from settings import Settings
 
@@ -426,9 +427,12 @@ def notify_booking(
     events: list[booking.BookingEvent],
     sender: notifier.EmailSender | None,
     default_recipients: list[str],
-    cancel_base_url: str,
+    canceller=None,
 ) -> None:
-    """Письма о записях, отменах и ошибках автозаписи"""
+    """
+    Письма о записях, отменах и ошибках автозаписи.
+    canceller даёт ссылку отмены: ящик для писем с отменой или веб-сервер
+    """
     by_recipients: dict[tuple[str, ...], list[booking.BookingEvent]] = {}
     for event in events:
         recipients = tuple(event.recipients or default_recipients)
@@ -436,7 +440,7 @@ def notify_booking(
 
     for recipients, group in by_recipients.items():
         subject = notifier.compose_booking_subject(group)
-        text = notifier.compose_booking_text(group, cancel_base_url)
+        text = notifier.compose_booking_text(group, canceller)
         if sender is None:
             print(f"\n--- {subject} -> {', '.join(recipients) or 'никому'} ---")
             print(text)
@@ -449,11 +453,46 @@ def notify_booking(
                 to=list(recipients),
                 subject=subject,
                 text=text,
-                html_body=notifier.compose_booking_html(group, cancel_base_url),
+                html_body=notifier.compose_booking_html(group, canceller),
             )
         except notifier.EmailError as error:
             # запись уже сделана, письмо - не повод падать
             logger.error("письмо о записи не ушло: %s", error)
+
+
+def process_cancel_requests(
+    mailbox: mail_cancel.CancelMailbox,
+    booker: booking.Booker,
+) -> list[booking.BookingEvent]:
+    """Отменяет записи, про которые пришли письма с отменой"""
+    try:
+        requests = mailbox.fetch_requests()
+    except mail_cancel.MailCancelError as error:
+        logger.warning("%s", error)
+        return []
+
+    events: list[booking.BookingEvent] = []
+    for request in requests:
+        item = booker.store.get(request.token)
+        if item is None or not item.is_active:
+            continue
+        logger.info("письмо от %s: отменить запись на %s", request.sender, item.visit_start)
+        try:
+            booker.cancel_by_user(request.token)
+        except gorzdrav.GorzdravError as error:
+            message = f"не получилось отменить запись по письму: {error.message}"
+            logger.error("%s", message)
+            # письмо с отменой останется в ящике, бот попробует на следующей проверке
+            if booker.store.should_report_failure(
+                f"cancel|{request.token}", message, booking.spb_now(), booker.failure_cooldown
+            ):
+                events.append(
+                    booking.BookingEvent(kind="failed", watch=item.watch, booking=item, message=message)
+                )
+            continue
+        events.append(booking.BookingEvent(kind="cancelled", watch=item.watch, booking=item))
+    booker.store.save()
+    return events
 
 
 def run_once(
@@ -462,7 +501,8 @@ def run_once(
     sender: notifier.EmailSender | None,
     default_recipients: list[str],
     booker: booking.Booker | None = None,
-    cancel_base_url: str = "",
+    canceller=None,
+    mailbox: mail_cancel.CancelMailbox | None = None,
 ) -> int:
     """
     Одна проверка всех отслеживаний.
@@ -473,6 +513,9 @@ def run_once(
     """
     found_doctors: list[FoundDoctor] = []
     events: list[booking.BookingEvent] = []
+    # сначала отмены: отменённое время не должно попасть в перезапись
+    if mailbox is not None and booker is not None:
+        events.extend(process_cancel_requests(mailbox, booker))
     for watch in watches:
         if watch.auto_book and booker is not None and booker.is_done(watch):
             logger.debug("'%s': уже записаны, не проверяем", watch.name)
@@ -491,7 +534,7 @@ def run_once(
 
     logger.info("врачей со свободными местами: %s", len(found_doctors))
     if events:
-        notify_booking(events, sender, default_recipients, cancel_base_url)
+        notify_booking(events, sender, default_recipients, canceller)
 
     state.forget_gone({found.key for found in found_doctors})
     to_notify = [found for found in found_doctors if state.should_notify(found)]
@@ -628,6 +671,13 @@ def main() -> None:
             + f"письма пойдут с {settings.email_from} на "
             + f"{', '.join(settings.email_to) or 'не задано (EMAIL_TO)'}"
         )
+        if settings.cancel_by_email:
+            try:
+                mail_cancel.CancelMailbox.from_settings(settings, settings.email_to).check_login()
+            except mail_cancel.MailCancelError as error:
+                logger.error("%s", error)
+                sys.exit(1)
+            print(f"ящик для отмены доступен: {settings.imap_host}:{settings.imap_port}")
         return
 
     if args.url:
@@ -688,18 +738,29 @@ def main() -> None:
                 ) if active else "",
             )
 
-    cancel_base_url = settings.cancel_url
+    canceller = None
+    mailbox: mail_cancel.CancelMailbox | None = None
+    if settings.cancel_by_email:
+        canceller = mail_cancel.CancelMailbox.from_settings(
+            settings, default_recipients + [item for watch in watches for item in watch.email]
+        )
+        # в пробном режиме ящик не читаем, чтобы ничего не отменить
+        mailbox = None if args.dry_run else canceller
+        logger.info("отмена записи письмом на %s", settings.smtp_user)
+    elif settings.cancel_url:
+        canceller = cancel_server.WebCancel(settings.cancel_url)
+
     if args.once:
-        run_once(watches, state, sender, default_recipients, booker, cancel_base_url)
+        run_once(watches, state, sender, default_recipients, booker, canceller, mailbox)
         return
 
-    if cancel_base_url and not args.dry_run:
+    if settings.cancel_url and not settings.cancel_by_email and not args.dry_run:
         def on_cancel(cancelled: booking.Booking) -> None:
             notify_booking(
                 [booking.BookingEvent(kind="cancelled", watch=cancelled.watch, booking=cancelled)],
                 sender,
                 default_recipients,
-                cancel_base_url,
+                canceller,
             )
 
         cancel_server.start(settings.cancel_listen, booker, on_cancel)
@@ -714,7 +775,7 @@ def main() -> None:
     while True:
         if not args.url:
             watches = reload_watches(Path(args.config), watches)
-        run_once(watches, state, sender, default_recipients, booker, cancel_base_url)
+        run_once(watches, state, sender, default_recipients, booker, canceller, mailbox)
         # случайная пауза, чтобы запросы не шли по ровному расписанию
         time.sleep(random.uniform(args.interval, interval_max))
 

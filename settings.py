@@ -90,6 +90,9 @@ class Settings:
     bookings_file: Path = BASE_DIR / "bookings.json"
     cancel_url: str = ""
     cancel_listen: str = "127.0.0.1:8085"
+    cancel_by_email: bool = False
+    imap_host: str = ""
+    imap_port: int = 993
 
     def patient(self) -> Patient:
         """
@@ -159,4 +162,9 @@ class Settings:
             ),
             cancel_url=os.environ.get("CANCEL_URL", "").strip(),
             cancel_listen=os.environ.get("CANCEL_LISTEN", "127.0.0.1:8085").strip(),
+            cancel_by_email=os.environ.get("CANCEL_BY_EMAIL", "").strip().lower() in TRUE_VALUES,
+            # smtp.mail.ru -> imap.mail.ru, так у mail.ru, яндекса и гугла
+            imap_host=os.environ.get("IMAP_HOST", "").strip()
+            or os.environ.get("SMTP_HOST", "").replace("smtp.", "imap.", 1),
+            imap_port=_int_env("IMAP_PORT", 993),
         )
