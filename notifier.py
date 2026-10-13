@@ -1,13 +1,16 @@
 """Отправка писем и сообщений в телеграм о свободных талонах и записях"""
 
 import html
+import http.client
 import json
 import logging
 import smtplib
+import socket
 import ssl
 import urllib.error
 import urllib.request
 from email.message import EmailMessage
+from urllib.parse import unquote, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +142,81 @@ class EmailSender:
             raise EmailError(f"Не удалось подключиться к почте: {error}") from error
 
 
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise TelegramError("прокси закрыл соединение")
+        data += chunk
+    return data
+
+
+def socks5_connect(proxy: str, host: str, port: int, timeout: float | None) -> socket.socket:
+    """
+    Соединение с host:port через socks5 прокси вида socks5://[логин:пароль@]host:port.
+    Имя host разрешает сам прокси - сервер его в dns не спрашивает
+    Raises:
+        TelegramError: прокси задан неверно или не соединил
+        OSError: прокси недоступен
+    """
+    parts = urlsplit(proxy)
+    # в тексте ошибок нет самого адреса: в нём может быть пароль
+    if parts.scheme not in ("socks5", "socks5h") or not parts.hostname or not parts.port:
+        raise TelegramError("TELEGRAM_PROXY должен быть вида socks5://host:port")
+    user = unquote(parts.username or "").encode()
+    password = unquote(parts.password or "").encode()
+    sock = socket.create_connection((parts.hostname, parts.port), timeout=timeout)
+    try:
+        # приветствие: без авторизации или по логину и паролю
+        sock.sendall(b"\x05\x02\x00\x02" if user else b"\x05\x01\x00")
+        version, method = _recv_exact(sock, 2)
+        if version != 5:
+            raise TelegramError("по адресу TELEGRAM_PROXY не socks5 прокси")
+        if method == 2:
+            sock.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(password)]) + password)
+            if _recv_exact(sock, 2)[1] != 0:
+                raise TelegramError("socks5 прокси не принял логин и пароль")
+        elif method != 0:
+            raise TelegramError("socks5 прокси требует логин и пароль в TELEGRAM_PROXY")
+        name = host.encode("idna")
+        sock.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + port.to_bytes(2, "big"))
+        reply = _recv_exact(sock, 4)
+        if reply[1] != 0:
+            raise TelegramError(f"socks5 прокси не соединил с {host}, код {reply[1]}")
+        # дальше адрес, к которому привязался прокси - он не нужен, но его надо дочитать
+        address_size = {1: 4, 4: 16}.get(reply[3]) or _recv_exact(sock, 1)[0]
+        _recv_exact(sock, address_size + 2)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+class _SocksHTTPSConnection(http.client.HTTPSConnection):
+    """https поверх socks5: tls до самого сервера, сертификат проверяется как обычно"""
+
+    def __init__(self, host: str, proxy: str, timeout=None, **kwargs) -> None:
+        self.ssl_context = ssl.create_default_context()
+        super().__init__(host, timeout=timeout, context=self.ssl_context)
+        self.proxy = proxy
+
+    def connect(self) -> None:
+        sock = socks5_connect(self.proxy, self.host, self.port, self.timeout)
+        self.sock = self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _SocksHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, proxy: str) -> None:
+        super().__init__()
+        self.proxy = proxy
+
+    def https_open(self, req):
+        return self.do_open(
+            lambda host, **kwargs: _SocksHTTPSConnection(host, self.proxy, **kwargs), req
+        )
+
+
 class TelegramSender:
     """Сообщения в телеграм от бота, созданного через @BotFather"""
 
@@ -147,11 +225,14 @@ class TelegramSender:
         token: str,
         chat_ids: list[str],
         api_url: str = TELEGRAM_API_URL,
+        proxy: str = "",
         timeout_secs: int = 30,
     ) -> None:
         self.token = token
         self.chat_ids = chat_ids
         self.api_url = api_url.rstrip("/")
+        # socks5 прокси, если телеграм с сервера напрямую недоступен
+        self.proxy = proxy
         self.timeout_secs = timeout_secs
 
     @classmethod
@@ -163,6 +244,7 @@ class TelegramSender:
             token=settings.telegram_token,
             chat_ids=settings.telegram_chat_ids,
             api_url=settings.telegram_api_url or TELEGRAM_API_URL,
+            proxy=settings.telegram_proxy,
         )
 
     def bot_name(self) -> str:
@@ -213,8 +295,16 @@ class TelegramSender:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        if self.proxy:
+            # ProxyHandler({}) - чтобы HTTPS_PROXY из окружения не встал поверх socks
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), _SocksHTTPSHandler(self.proxy)
+            )
+            open_url = opener.open
+        else:
+            open_url = urllib.request.urlopen
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_secs) as response:
+            with open_url(request, timeout=self.timeout_secs) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             # телеграм объясняет ошибку в теле ответа: "Bad Request: chat not found"

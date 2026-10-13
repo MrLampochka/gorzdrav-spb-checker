@@ -78,7 +78,33 @@ python3 checker.py --check-email
 -- | --
 `TELEGRAM_BOT_TOKEN` | токен бота от @BotFather
 `TELEGRAM_CHAT_ID` | куда слать, можно несколько через запятую. У групп id отрицательный
-`TELEGRAM_API_URL` | если `api.telegram.org` с сервера недоступен — адрес прокси к нему
+`TELEGRAM_PROXY` | если `api.telegram.org` с сервера недоступен — socks5 прокси: `socks5://host:port` или `socks5://логин:пароль@host:port`
+`TELEGRAM_API_URL` | или адрес своего сервера, который пересылает запросы в `api.telegram.org`
+
+### Если телеграм с сервера заблокирован
+
+Проще всего — ssh туннель на свой сервер за границей: он даёт socks5 прокси на сервере с ботом,
+а снаружи виден только ssh. На сервере с ботом:
+
+```sh
+ssh-keygen -t ed25519 -N "" -f /etc/telegram-tunnel/id_ed25519
+```
+
+На зарубежном сервере заводим пользователя, которому можно только ходить в `api.telegram.org`:
+
+```sh
+useradd --system --create-home --shell /usr/sbin/nologin tgtunnel
+mkdir -p ~tgtunnel/.ssh
+echo 'restrict,port-forwarding,permitopen="api.telegram.org:443" <публичный ключ>' > ~tgtunnel/.ssh/authorized_keys
+chown -R tgtunnel: ~tgtunnel/.ssh && chmod 700 ~tgtunnel/.ssh && chmod 600 ~tgtunnel/.ssh/authorized_keys
+```
+
+Туннель держит служба `telegram-tunnel.service` (лежит в репозитории, адрес сервера в ней поправить),
+а в `.env`:
+
+```sh
+TELEGRAM_PROXY=socks5://127.0.0.1:1080
+```
 
 Если сообщение в телеграм дошло, а письмо нет, про этих врачей не напоминаем повторно на следующей проверке.
 

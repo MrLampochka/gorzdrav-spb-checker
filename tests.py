@@ -8,7 +8,9 @@ import datetime
 import imaplib
 import io
 import json
+import socket
 import tempfile
+import threading
 import unittest
 import urllib.error
 from pathlib import Path
@@ -640,6 +642,53 @@ class TestTelegram(unittest.TestCase):
         # без телеграма ошибка почты пробрасывается, чтобы письмо повторили
         with self.assertRaises(notifier.EmailError):
             notify(found_with(slot_at(0, 16)), sender, ["me@mail.ru"])
+
+
+class FakeSocks5:
+    """Socks5 прокси на одно соединение: проверяет логин и запоминает, куда просили соединить"""
+
+    def __init__(self, password: bytes = b"pass"):
+        self.password = password
+        self.target: tuple[str, int] | None = None
+        self.server = socket.create_server(("127.0.0.1", 0))
+        self.port = self.server.getsockname()[1]
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        conn, _ = self.server.accept()
+        with conn, self.server:
+            greeting = conn.recv(2)
+            conn.recv(greeting[1])
+            conn.sendall(b"\x05\x02")
+            auth = conn.recv(256)
+            user_size = auth[1]
+            password = auth[3 + user_size:]
+            if password != self.password:
+                conn.sendall(b"\x01\x01")
+                return
+            conn.sendall(b"\x01\x00")
+            request = conn.recv(256)
+            name_size = request[4]
+            self.target = (request[5:5 + name_size].decode(), int.from_bytes(request[5 + name_size:], "big"))
+            conn.sendall(b"\x05\x00\x00\x01" + bytes(4) + b"\x00\x00")
+
+
+class TestSocks5(unittest.TestCase):
+    def test_connects_with_password_by_name(self):
+        proxy = FakeSocks5()
+        sock = notifier.socks5_connect(f"socks5://user:pass@127.0.0.1:{proxy.port}", "api.telegram.org", 443, 5)
+        sock.close()
+        self.assertEqual(proxy.target, ("api.telegram.org", 443))
+
+    def test_wrong_password(self):
+        proxy = FakeSocks5()
+        with self.assertRaises(notifier.TelegramError) as caught:
+            notifier.socks5_connect(f"socks5://user:wrong@127.0.0.1:{proxy.port}", "api.telegram.org", 443, 5)
+        self.assertNotIn("wrong", str(caught.exception))
+
+    def test_bad_proxy_url(self):
+        with self.assertRaises(notifier.TelegramError):
+            notifier.socks5_connect("http://127.0.0.1:8080", "api.telegram.org", 443, 5)
 
 
 class FakeImap:

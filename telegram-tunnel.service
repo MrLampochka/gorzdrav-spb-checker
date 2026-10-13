@@ -1,0 +1,28 @@
+# ssh туннель до зарубежного сервера: socks5 прокси на 127.0.0.1:1080 для телеграма,
+# если api.telegram.org с сервера с ботом заблокирован. В .env: TELEGRAM_PROXY=socks5://127.0.0.1:1080
+# Установка (подробнее в README, раздел "Если телеграм с сервера заблокирован"):
+#   sudo cp telegram-tunnel.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now telegram-tunnel
+# Адрес сервера ниже - поправить под свой.
+
+[Unit]
+Description=SSH tunnel to Telegram API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -D 127.0.0.1:1080 \
+    -i /etc/telegram-tunnel/id_ed25519 \
+    -o UserKnownHostsFile=/etc/telegram-tunnel/known_hosts \
+    -o StrictHostKeyChecking=yes \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    tgtunnel@203.0.113.10
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

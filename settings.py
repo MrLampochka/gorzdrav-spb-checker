@@ -96,6 +96,7 @@ class Settings:
     telegram_token: str = ""
     telegram_chat_ids: list[str] = field(default_factory=list)
     telegram_api_url: str = ""
+    telegram_proxy: str = ""
 
     def patient(self) -> Patient:
         """
@@ -173,4 +174,5 @@ class Settings:
             telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_ids=_list_env("TELEGRAM_CHAT_ID"),
             telegram_api_url=os.environ.get("TELEGRAM_API_URL", "").strip(),
+            telegram_proxy=os.environ.get("TELEGRAM_PROXY", "").strip(),
         )
