@@ -394,12 +394,30 @@ def read_watches(path: Path) -> list[Watch]:
     return watches
 
 
+def send_telegram(telegram: notifier.TelegramSender | None, text: str) -> bool:
+    """Отправляет сообщение в телеграм, если он настроен. True - доставлено"""
+    if telegram is None:
+        return False
+    try:
+        telegram.send(text)
+    except notifier.TelegramError as error:
+        logger.error("сообщение в телеграм не ушло: %s", error)
+        return False
+    return True
+
+
 def notify(
     found_doctors: list[FoundDoctor],
     sender: notifier.EmailSender | None,
     default_recipients: list[str],
+    telegram: notifier.TelegramSender | None = None,
 ) -> None:
-    """Отправляет письма, группируя врачей по получателям"""
+    """
+    Сообщение в телеграм и письма, сгруппированные по получателям
+    Raises:
+        notifier.EmailError: письмо не ушло, а в телеграм не доставлено
+    """
+    delivered = send_telegram(telegram, notifier.compose_telegram(found_doctors))
     by_recipients: dict[tuple[str, ...], list[FoundDoctor]] = {}
     for found in found_doctors:
         recipients = tuple(found.recipients or default_recipients)
@@ -415,12 +433,18 @@ def notify(
         if not recipients:
             logger.error("не задан EMAIL_TO и в отслеживании нет поля email")
             continue
-        sender.send(
-            to=list(recipients),
-            subject=subject,
-            text=text,
-            html_body=notifier.compose_html(doctors),
-        )
+        try:
+            sender.send(
+                to=list(recipients),
+                subject=subject,
+                text=text,
+                html_body=notifier.compose_html(doctors),
+            )
+        except notifier.EmailError as error:
+            # в телеграм уже пришло - повторять на следующей проверке не нужно
+            if not delivered:
+                raise
+            logger.error("письмо не ушло: %s", error)
 
 
 def notify_booking(
@@ -428,11 +452,13 @@ def notify_booking(
     sender: notifier.EmailSender | None,
     default_recipients: list[str],
     canceller=None,
+    telegram: notifier.TelegramSender | None = None,
 ) -> None:
     """
-    Письма о записях, отменах и ошибках автозаписи.
+    Сообщение в телеграм и письма о записях, отменах и ошибках автозаписи.
     canceller даёт ссылку отмены: ящик для писем с отменой или веб-сервер
     """
+    send_telegram(telegram, notifier.compose_booking_telegram(events, canceller))
     by_recipients: dict[tuple[str, ...], list[booking.BookingEvent]] = {}
     for event in events:
         recipients = tuple(event.recipients or default_recipients)
@@ -503,6 +529,7 @@ def run_once(
     booker: booking.Booker | None = None,
     canceller=None,
     mailbox: mail_cancel.CancelMailbox | None = None,
+    telegram: notifier.TelegramSender | None = None,
 ) -> int:
     """
     Одна проверка всех отслеживаний.
@@ -534,7 +561,7 @@ def run_once(
 
     logger.info("врачей со свободными местами: %s", len(found_doctors))
     if events:
-        notify_booking(events, sender, default_recipients, canceller)
+        notify_booking(events, sender, default_recipients, canceller, telegram)
 
     state.forget_gone({found.key for found in found_doctors})
     to_notify = [found for found in found_doctors if state.should_notify(found)]
@@ -552,7 +579,7 @@ def run_once(
         )
 
     try:
-        notify(to_notify, sender, default_recipients)
+        notify(to_notify, sender, default_recipients, telegram)
     except notifier.EmailError as error:
         logger.error("%s", error)
         state.save()
@@ -615,6 +642,8 @@ def parse_args(settings: Settings) -> argparse.Namespace:
                         help="файл с историей отправленных писем")
     parser.add_argument("--check-email", action="store_true",
                         help="проверить настройки почты (письмо не отправляется)")
+    parser.add_argument("--check-telegram", action="store_true",
+                        help="проверить бота телеграма и прислать тестовое сообщение")
     parser.add_argument("--list-districts", action="store_true", help="список районов")
     parser.add_argument("--list-lpus", metavar="DISTRICT_ID", help="список медучреждений")
     parser.add_argument("--list-specialties", metavar="LPU_ID", type=int,
@@ -680,6 +709,10 @@ def main() -> None:
             print(f"ящик для отмены доступен: {settings.imap_host}:{settings.imap_port}")
         return
 
+    if args.check_telegram:
+        check_telegram(settings)
+        return
+
     if args.url:
         watch = Watch.from_dict({"url": args.url, "limitDays": args.limit_days})
         if not watch.is_valid:
@@ -700,11 +733,18 @@ def main() -> None:
     )
 
     sender: notifier.EmailSender | None = None
+    telegram: notifier.TelegramSender | None = None
     if not args.dry_run:
         sender = notifier.EmailSender.from_settings(settings)
         if not default_recipients and not any(watch.email for watch in watches):
             logger.error("не заданы получатели: EMAIL_TO в .env или --email")
             sys.exit(1)
+        telegram = notifier.TelegramSender.from_settings(settings)
+        if telegram is not None and not telegram.chat_ids:
+            logger.error("не задан TELEGRAM_CHAT_ID, узнать его: python3 checker.py --check-telegram")
+            sys.exit(1)
+        if telegram is not None:
+            logger.info("сообщения в телеграм: чатов %s", len(telegram.chat_ids))
 
     state = NotifyState(
         path=Path(args.state_file),
@@ -751,7 +791,7 @@ def main() -> None:
         canceller = cancel_server.WebCancel(settings.cancel_url)
 
     if args.once:
-        run_once(watches, state, sender, default_recipients, booker, canceller, mailbox)
+        run_once(watches, state, sender, default_recipients, booker, canceller, mailbox, telegram)
         return
 
     if settings.cancel_url and not settings.cancel_by_email and not args.dry_run:
@@ -761,6 +801,7 @@ def main() -> None:
                 sender,
                 default_recipients,
                 canceller,
+                telegram,
             )
 
         cancel_server.start(settings.cancel_listen, booker, on_cancel)
@@ -775,9 +816,33 @@ def main() -> None:
     while True:
         if not args.url:
             watches = reload_watches(Path(args.config), watches)
-        run_once(watches, state, sender, default_recipients, booker, canceller, mailbox)
+        run_once(watches, state, sender, default_recipients, booker, canceller, mailbox, telegram)
         # случайная пауза, чтобы запросы не шли по ровному расписанию
         time.sleep(random.uniform(args.interval, interval_max))
+
+
+def check_telegram(settings: Settings) -> None:
+    """--check-telegram: проверяет токен и шлёт тестовое сообщение или подсказывает id чата"""
+    telegram = notifier.TelegramSender.from_settings(settings)
+    if telegram is None:
+        logger.error("не задан TELEGRAM_BOT_TOKEN: создайте бота у @BotFather и пропишите токен в .env")
+        sys.exit(1)
+    try:
+        bot = telegram.bot_name()
+        if not telegram.chat_ids:
+            chats = telegram.find_chats()
+            if not chats:
+                print(f"бот {bot} работает. Напишите ему любое сообщение и запустите проверку снова")
+                return
+            print(f"бот {bot} работает. Пропишите в .env TELEGRAM_CHAT_ID одного из чатов:")
+            for chat_id, name in chats:
+                print(f"{chat_id}\t{name}")
+            return
+        telegram.send("Горздрав: проверка связи. Сюда будут приходить талоны и записи.")
+    except notifier.TelegramError as error:
+        logger.error("телеграм: %s", error)
+        sys.exit(1)
+    print(f"бот {bot} отправил тестовое сообщение в чаты: {', '.join(telegram.chat_ids)}")
 
 
 def make_booker(

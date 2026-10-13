@@ -363,6 +363,9 @@ class Booker:
             if any(not self.store.owns(item.id) for item in in_week):
                 continue
             mine = self.store.active_in_week(watch.name, week) if week else []
+            # приём в этой неделе уже прошёл или вот-вот начнётся - вторую запись не делаем
+            if any(item.visit_start - now < MIN_LEAD for item in mine):
+                continue
             if not mine:
                 events += self._book(watch, patient_id, week_slots, week, now)
                 continue

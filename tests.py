@@ -6,9 +6,11 @@
 
 import datetime
 import imaplib
+import io
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +23,7 @@ from checker import (
     NotifyState,
     Watch,
     appointments_in_limit,
+    notify,
     reload_watches,
 )
 from settings import Settings
@@ -429,6 +432,35 @@ class TestBooker(unittest.TestCase):
         booker.process(self.weekly, found_with(slot_at(2, 16)))
         self.assertEqual(len(self.fake.create_calls), calls)
 
+    def test_week_with_past_visit_is_not_rebooked(self):
+        booker = self.booker()
+        booker.process(self.weekly, found_with(slot_at(0, 11)))
+        # вторник 7:33: приём понедельника уже прошёл, вторник 16:00 удобнее, но это вторая запись
+        tuesday = MONDAY + datetime.timedelta(days=1, hours=7, minutes=33)
+        with mock.patch.object(booking, "spb_now", return_value=tuesday):
+            events = booker.process(self.weekly, found_with(slot_at(1, 16), slot_at(8, 16)))
+        # следующую неделю записывает как обычно
+        self.assertEqual([event.booking.visit_start for event in events], [slot_at(8, 16).visit_start])
+        self.assertEqual(self.fake.cancel_calls, [])
+
+    def test_visit_starting_soon_is_not_rebooked(self):
+        booker = self.booker()
+        booker.process(self.weekly, found_with(slot_at(0, 11)))
+        with mock.patch.object(booking, "spb_now", return_value=MONDAY + datetime.timedelta(hours=10)):
+            self.assertEqual(booker.process(self.weekly, found_with(slot_at(2, 16))), [])
+        self.assertEqual(list(self.fake.booked), [slot_at(0, 11).id])
+
+    def test_failed_cancel_of_previous_is_not_called_cancelled(self):
+        booker = self.booker()
+        booker.process(self.weekly, found_with(slot_at(0, 9)))
+        with mock.patch.object(gorzdrav, "cancel_appointment",
+                               side_effect=gorzdrav.GorzdravError("Что-то пошло не так")):
+            events = booker.process(self.weekly, found_with(slot_at(2, 16)))
+        text = notifier.compose_booking_text(events)
+        self.assertNotIn("Прежняя запись отменена", text)
+        self.assertIn("Прежняя запись: ", text)
+        self.assertIn("отменить не получилось", text)
+
     def test_tries_next_slot_when_taken(self):
         self.fake.taken.add(slot_at(0, 16).id)
         events = self.booker().process(self.weekly, found_with(slot_at(0, 16), slot_at(1, 17)))
@@ -515,6 +547,99 @@ class TestBooker(unittest.TestCase):
         # у отменённой записи кнопки нет
         events[0].booking.status = booking.STATUS_CANCELLED
         self.assertNotIn("mailto:", notifier.compose_booking_html(events, mailbox))
+
+
+class FakeResponse:
+    def __init__(self, payload: dict):
+        self.body = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class TestTelegram(unittest.TestCase):
+    def setUp(self):
+        self.requests: list = []
+        self.telegram = notifier.TelegramSender("123:secret", ["111", "222"])
+
+    def urlopen(self, payload: dict | None = None):
+        def fake(request, timeout):
+            self.requests.append(request)
+            return FakeResponse(payload or {"ok": True, "result": {}})
+
+        return mock.patch("urllib.request.urlopen", side_effect=fake)
+
+    def test_sends_html_to_every_chat(self):
+        with self.urlopen():
+            self.telegram.send("<b>привет</b>")
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.requests[0].full_url, "https://api.telegram.org/bot123:secret/sendMessage")
+        body = json.loads(self.requests[1].data)
+        self.assertEqual(body["chat_id"], "222")
+        self.assertEqual(body["parse_mode"], "HTML")
+        self.assertEqual(body["text"], "<b>привет</b>")
+
+    def test_error_has_description_but_not_token(self):
+        error = urllib.error.HTTPError(
+            "https://api.telegram.org/bot123:secret/sendMessage", 400, "Bad Request", {},
+            io.BytesIO(b'{"ok":false,"description":"Bad Request: chat not found"}'),
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(notifier.TelegramError) as caught:
+                self.telegram.send("привет")
+        self.assertIn("chat not found", str(caught.exception))
+        self.assertNotIn("secret", str(caught.exception))
+
+    def test_find_chats(self):
+        updates = {"ok": True, "result": [
+            {"message": {"chat": {"id": 111, "first_name": "Иван"}}},
+            {"message": {"chat": {"id": 111, "first_name": "Иван"}}},
+            {"channel_post": {"chat": {"id": -100, "title": "Горздрав"}}},
+        ]}
+        with self.urlopen(updates):
+            self.assertEqual(self.telegram.find_chats(), [("111", "Иван"), ("-100", "Горздрав")])
+
+    def test_slots_message(self):
+        found = found_with(slot_at(2, 16), slot_at(0, 11))
+        found[0].doctor.name = "Иванов <Иван>"
+        text = notifier.compose_telegram(found)
+        self.assertIn("Иванов &lt;Иван&gt;", text)
+        # талоны по порядку и с днём недели
+        self.assertIn("Талоны: пн 07.01 11:00, ср 09.01 16:00", text)
+        self.assertIn('<a href="https://example.com">Записаться</a>', text)
+
+    def test_long_message_is_cut_by_doctors(self):
+        found = found_with(*[slot_at(day, 16) for day in range(30)]) * 40
+        text = notifier.compose_telegram(found)
+        self.assertLessEqual(len(text), notifier.TELEGRAM_MAX_LENGTH + 20)
+        self.assertIn("и ещё 20", text)
+        self.assertTrue(text.endswith(tuple(f"и ещё {n}" for n in range(1, 40))))
+
+    def test_booking_message_has_cancel_link(self):
+        import cancel_server
+
+        event = booking.BookingEvent(kind="booked", watch="тест", booking=booking.Booking(
+            token="tok", watch="тест", lpu_id=526, patient_id="p1", appointment_id="a1",
+            doctor_id="1", doctor_name="Иванов Иван", visit_start=slot_at(1, 16).visit_start, rank=0,
+        ))
+        text = notifier.compose_booking_telegram([event], cancel_server.WebCancel("https://example.ru/gz"))
+        self.assertIn("<b>Записал на приём - тест</b>", text)
+        self.assertIn('<a href="https://example.ru/gz/cancel/tok">Отменить запись</a>', text)
+
+    def test_notify_counts_telegram_when_email_fails(self):
+        sender = mock.Mock()
+        sender.send.side_effect = notifier.EmailError("smtp недоступен")
+        with self.urlopen():
+            notify(found_with(slot_at(0, 16)), sender, ["me@mail.ru"], self.telegram)
+        # без телеграма ошибка почты пробрасывается, чтобы письмо повторили
+        with self.assertRaises(notifier.EmailError):
+            notify(found_with(slot_at(0, 16)), sender, ["me@mail.ru"])
 
 
 class FakeImap:
@@ -677,6 +802,17 @@ class TestSettings(unittest.TestCase):
                 settings = Settings.load(env_file)
         self.assertEqual(settings.imap_host, "imap.mail.ru")
         self.assertTrue(settings.cancel_by_email)
+
+    def test_telegram_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text('TELEGRAM_BOT_TOKEN="123:abc"\nTELEGRAM_CHAT_ID=111, -222\n', encoding="utf-8")
+            with mock.patch.dict("os.environ", {}, clear=True):
+                settings = Settings.load(env_file)
+        telegram = notifier.TelegramSender.from_settings(settings)
+        self.assertEqual(telegram.chat_ids, ["111", "-222"])
+        self.assertEqual(telegram.api_url, notifier.TELEGRAM_API_URL)
+        self.assertIsNone(notifier.TelegramSender.from_settings(Settings()))
 
     def test_random_interval_bounds(self):
         self.assertEqual(Settings(interval_secs=300).interval_max_secs, 300)

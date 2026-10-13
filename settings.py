@@ -93,6 +93,9 @@ class Settings:
     cancel_by_email: bool = False
     imap_host: str = ""
     imap_port: int = 993
+    telegram_token: str = ""
+    telegram_chat_ids: list[str] = field(default_factory=list)
+    telegram_api_url: str = ""
 
     def patient(self) -> Patient:
         """
@@ -167,4 +170,7 @@ class Settings:
             imap_host=os.environ.get("IMAP_HOST", "").strip()
             or os.environ.get("SMTP_HOST", "").replace("smtp.", "imap.", 1),
             imap_port=_int_env("IMAP_PORT", 993),
+            telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
+            telegram_chat_ids=_list_env("TELEGRAM_CHAT_ID"),
+            telegram_api_url=os.environ.get("TELEGRAM_API_URL", "").strip(),
         )

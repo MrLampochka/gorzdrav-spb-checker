@@ -1,16 +1,30 @@
-"""Отправка писем о свободных талонах"""
+"""Отправка писем и сообщений в телеграм о свободных талонах и записях"""
 
 import html
+import json
 import logging
 import smtplib
 import ssl
+import urllib.error
+import urllib.request
 from email.message import EmailMessage
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_API_URL = "https://api.telegram.org"
+# длиннее телеграм не принимает, берём с запасом
+TELEGRAM_MAX_LENGTH = 4000
+# сколько талонов врача перечислять в сообщении
+TELEGRAM_MAX_SLOTS = 10
+WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+
 
 class EmailError(Exception):
     """Ошибка настройки или отправки почты"""
+
+
+class TelegramError(Exception):
+    """Ошибка отправки в телеграм"""
 
 
 class EmailSender:
@@ -125,6 +139,95 @@ class EmailSender:
             raise EmailError(f"Не удалось подключиться к почте: {error}") from error
 
 
+class TelegramSender:
+    """Сообщения в телеграм от бота, созданного через @BotFather"""
+
+    def __init__(
+        self,
+        token: str,
+        chat_ids: list[str],
+        api_url: str = TELEGRAM_API_URL,
+        timeout_secs: int = 30,
+    ) -> None:
+        self.token = token
+        self.chat_ids = chat_ids
+        self.api_url = api_url.rstrip("/")
+        self.timeout_secs = timeout_secs
+
+    @classmethod
+    def from_settings(cls, settings) -> "TelegramSender | None":
+        """Отправщик из настроек, None - если TELEGRAM_BOT_TOKEN не задан"""
+        if not settings.telegram_token:
+            return None
+        return cls(
+            token=settings.telegram_token,
+            chat_ids=settings.telegram_chat_ids,
+            api_url=settings.telegram_api_url or TELEGRAM_API_URL,
+        )
+
+    def bot_name(self) -> str:
+        """
+        Имя бота - заодно проверка токена
+        Raises:
+            TelegramError: токен неверный или телеграм недоступен
+        """
+        return "@" + str((self._call("getMe") or {}).get("username", ""))
+
+    def find_chats(self) -> list[tuple[str, str]]:
+        """Чаты, которые недавно писали боту: (id, название) - так узнаётся TELEGRAM_CHAT_ID"""
+        chats: dict[str, str] = {}
+        for update in self._call("getUpdates") or []:
+            message = update.get("message") or update.get("channel_post") or {}
+            chat = message.get("chat") or {}
+            if "id" not in chat:
+                continue
+            name = " ".join(filter(None, (chat.get("first_name"), chat.get("last_name"))))
+            chats[str(chat["id"])] = chat.get("title") or name or chat.get("username", "")
+        return list(chats.items())
+
+    def send(self, text: str) -> None:
+        """
+        Отправляет сообщение с html разметкой телеграма во все чаты
+        Raises:
+            TelegramError: если хоть в один чат не ушло
+        """
+        if not self.chat_ids:
+            raise TelegramError("не задан TELEGRAM_CHAT_ID")
+        for chat_id in self.chat_ids:
+            self._call(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "link_preview_options": {"is_disabled": True},
+                },
+            )
+        logger.info("сообщение в телеграм отправлено")
+
+    def _call(self, method: str, body: dict | None = None):
+        # в тексте ошибок не должно быть адреса: в нём токен бота
+        request = urllib.request.Request(
+            url=f"{self.api_url}/bot{self.token}/{method}",
+            data=json.dumps(body or {}, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_secs) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            # телеграм объясняет ошибку в теле ответа: "Bad Request: chat not found"
+            try:
+                description = json.loads(error.read().decode("utf-8")).get("description")
+            except (OSError, ValueError, AttributeError):
+                description = ""
+            raise TelegramError(description or f"http ошибка {error.code}") from error
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise TelegramError(f"телеграм недоступен: {error}") from error
+        return payload.get("result")
+
+
 def compose_subject(found_doctors: list) -> str:
     """Тема письма"""
     if len(found_doctors) == 1:
@@ -228,7 +331,9 @@ def _booking_lines(event) -> list[str]:
         lines.append(event.booking.doctor_name)
         lines.append(describe_booking(event.booking))
     if event.previous:
-        lines.append("Прежняя запись отменена: " + describe_booking(event.previous))
+        # прежнюю запись могло не получиться отменить - тогда об этом скажет message
+        label = "Прежняя запись" if event.previous.is_active else "Прежняя запись отменена"
+        lines.append(f"{label}: " + describe_booking(event.previous))
     if event.message:
         lines.append(event.message)
     return lines
@@ -287,3 +392,57 @@ def compose_booking_html(events: list, canceller=None) -> str:
         + "Письмо отправлено скриптом gorzdrav-email-checker.</p>"
         + "</body></html>"
     )
+
+
+def format_slot(visit_start) -> str:
+    """Время талона с днём недели: ср 15.10 16:00"""
+    return f"{WEEKDAYS[visit_start.weekday()]} {visit_start.strftime('%d.%m %H:%M')}"
+
+
+def _join_for_telegram(blocks: list[str]) -> str:
+    """Склеивает блоки сообщения, пока оно влезает в лимит телеграма"""
+    text = ""
+    for index, block in enumerate(blocks):
+        if len(text) + len(block) > TELEGRAM_MAX_LENGTH:
+            return text + f"\n\n…и ещё {len(blocks) - index}"
+        text += ("\n\n" if text else "") + block
+    return text
+
+
+def compose_telegram(found_doctors: list) -> str:
+    """Сообщение в телеграм о свободных талонах: врач, время талонов, ссылка"""
+    blocks = ["Появились свободные талоны:"]
+    for found in found_doctors:
+        lines = [
+            f"<b>{html.escape(found.doctor.name)}</b>",
+            html.escape(found.watch_name),
+        ]
+        times = sorted(item.visit_start for item in found.appointments)
+        if times:
+            shown = ", ".join(format_slot(item) for item in times[:TELEGRAM_MAX_SLOTS])
+            if len(times) > TELEGRAM_MAX_SLOTS:
+                shown += f" и ещё {len(times) - TELEGRAM_MAX_SLOTS}"
+            lines.append(f"Талоны: {shown}")
+        else:
+            lines.append(f"Мест для записи: {found.doctor.free_participant_count}")
+        lines.append(f'<a href="{html.escape(found.link)}">Записаться</a>')
+        blocks.append("\n".join(lines))
+    return _join_for_telegram(blocks)
+
+
+def compose_booking_telegram(events: list, canceller=None) -> str:
+    """Сообщение в телеграм о записях, отменах и ошибках автозаписи"""
+    blocks = []
+    for event in events:
+        title, *rest = _booking_lines(event)
+        lines = [f"<b>{html.escape(title)}</b>"] + [html.escape(text) for text in rest]
+        cancel = _cancel_link(event, canceller)
+        if cancel:
+            link, hint = cancel
+            # ссылку mailto телеграм не откроет, для неё только подсказка
+            if link.startswith("http"):
+                lines.append(f'<a href="{html.escape(link)}">Отменить запись</a>')
+            else:
+                lines.append("Отменить запись: " + html.escape(hint))
+        blocks.append("\n".join(lines))
+    return _join_for_telegram(blocks)
